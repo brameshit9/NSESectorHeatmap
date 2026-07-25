@@ -7,11 +7,20 @@ NSE heatmap (https://www.nseindia.com/market-data/live-market-indices/heatmap).
 
 Auto-refreshes every 60 seconds.
 
+When the live market is closed (or NSE is temporarily blocking/rate-limiting
+requests), the dashboard falls back to the last successfully fetched data
+for each sector (persisted to a small local cache file) and clearly labels
+it as "previous session" data instead of showing an error.
+
 Data source: NSE India public API (www.nseindia.com/api/equity-stockIndices)
 """
 
+import json
+import os
 import time
 from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
@@ -23,6 +32,11 @@ import plotly.graph_objects as go
 # --------------------------------------------------------------------------
 REFRESH_SECONDS = 60
 TOP_N = 5
+IST = ZoneInfo("Asia/Kolkata")
+
+# Where we persist the last-known-good data for each sector, so we can show
+# "previous session" data when the market is closed or NSE blocks us.
+CACHE_FILE = Path(os.environ.get("NSE_CACHE_FILE", "/tmp/nse_sector_cache.json"))
 
 # Display name -> exact NSE index name (as used by the NSE API "index" param)
 SECTORS = {
@@ -58,6 +72,62 @@ HEADERS = {
     "Referer": "https://www.nseindia.com/market-data/live-market-indices/heatmap",
     "X-Requested-With": "XMLHttpRequest",
 }
+
+# --------------------------------------------------------------------------
+# MARKET HOURS
+# --------------------------------------------------------------------------
+def is_market_open(now: datetime | None = None) -> bool:
+    """NSE cash market: Mon-Fri, 09:15-15:30 IST (holidays not accounted for)."""
+    now = now or datetime.now(IST)
+    if now.weekday() >= 5:  # Sat/Sun
+        return False
+    open_t = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    return open_t <= now <= close_t
+
+
+# --------------------------------------------------------------------------
+# LOCAL CACHE (last-known-good data per sector)
+# --------------------------------------------------------------------------
+def _load_cache() -> dict:
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_cache(cache: dict) -> None:
+    try:
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(CACHE_FILE, "w") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass  # cache is best-effort; never break the app over it
+
+
+def _cache_get(sector_name: str) -> tuple[pd.DataFrame, str | None]:
+    cache = _load_cache()
+    entry = cache.get(sector_name)
+    if not entry:
+        return pd.DataFrame(), None
+    try:
+        df = pd.DataFrame(entry["data"])
+        return df, entry.get("timestamp")
+    except Exception:
+        return pd.DataFrame(), None
+
+
+def _cache_put(sector_name: str, df: pd.DataFrame) -> None:
+    cache = _load_cache()
+    cache[sector_name] = {
+        "timestamp": datetime.now(IST).isoformat(),
+        "data": df.to_dict(orient="records"),
+    }
+    _save_cache(cache)
+
 
 # --------------------------------------------------------------------------
 # DATA FETCHING
@@ -99,11 +169,28 @@ def fetch_index_constituents(index_name: str, retries: int = 3) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
-def load_all_sectors(sector_map: dict) -> tuple[dict, datetime]:
-    result = {}
+def load_all_sectors(sector_map: dict) -> tuple[dict, dict, datetime]:
+    """
+    Returns:
+        data: {display_name: DataFrame}
+        meta: {display_name: {"stale": bool, "as_of": str | None}}
+        fetched_at: when this run happened
+    """
+    data = {}
+    meta = {}
     for display_name, index_name in sector_map.items():
-        result[display_name] = fetch_index_constituents(index_name)
-    return result, datetime.now()
+        df = fetch_index_constituents(index_name)
+        if not df.empty:
+            _cache_put(display_name, df)
+            data[display_name] = df
+            meta[display_name] = {"stale": False, "as_of": None}
+        else:
+            # Live fetch failed (market closed, NSE blocking, etc.) -> fall back
+            # to the last successfully fetched data for this sector.
+            cached_df, cached_ts = _cache_get(display_name)
+            data[display_name] = cached_df
+            meta[display_name] = {"stale": not cached_df.empty, "as_of": cached_ts}
+    return data, meta, datetime.now()
 
 
 def top_bottom(df: pd.DataFrame, n: int = TOP_N):
@@ -196,6 +283,16 @@ def render_sector_chart(top: pd.DataFrame, bottom: pd.DataFrame, sector_name: st
     return fig
 
 
+def format_as_of(iso_ts: str | None) -> str:
+    if not iso_ts:
+        return "unknown time"
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+        return dt.strftime("%Y-%m-%d %H:%M:%S IST")
+    except Exception:
+        return iso_ts
+
+
 # --------------------------------------------------------------------------
 # APP LAYOUT
 # --------------------------------------------------------------------------
@@ -209,6 +306,13 @@ st.caption(
     "Live data from NSE India · Auto-refreshes every "
     f"{REFRESH_SECONDS} seconds · Source: nseindia.com/market-data/live-market-indices/heatmap"
 )
+
+market_open = is_market_open()
+if not market_open:
+    st.info(
+        "🕒 NSE market is currently closed (trading hours: Mon–Fri, 09:15–15:30 IST). "
+        "Showing the last available (previous session) data for each sector where live data isn't returned."
+    )
 
 with st.sidebar:
     st.header("Settings")
@@ -228,25 +332,32 @@ if not selected_sectors:
 
 with st.spinner("Fetching live NSE data..."):
     sector_map = {k: SECTORS[k] for k in selected_sectors}
-    all_data, fetched_at = load_all_sectors(sector_map)
+    all_data, all_meta, fetched_at = load_all_sectors(sector_map)
 
-st.caption(f"Last updated: {fetched_at.strftime('%Y-%m-%d %H:%M:%S')} (next refresh in ~{REFRESH_SECONDS}s)")
+st.caption(f"Last checked: {fetched_at.strftime('%Y-%m-%d %H:%M:%S')} (next refresh in ~{REFRESH_SECONDS}s)")
 
 any_data = False
 for sector_name in selected_sectors:
     df = all_data.get(sector_name, pd.DataFrame())
+    meta = all_meta.get(sector_name, {"stale": False, "as_of": None})
     top, bottom = top_bottom(df, TOP_N)
 
     st.subheader(sector_name)
 
     if top.empty and bottom.empty:
         st.info(
-            "Could not fetch live data for this sector right now "
-            "(NSE may be rate-limiting or temporarily unavailable). Will retry on next refresh."
+            "Could not fetch live data for this sector, and no previous-session data is "
+            "cached yet. Will retry on next refresh."
         )
         continue
 
     any_data = True
+
+    if meta["stale"]:
+        st.caption(
+            f"⏮️ Showing previous session data (as of {format_as_of(meta['as_of'])}) — "
+            "live NSE data unavailable right now."
+        )
 
     if view_mode == "Tiles (heatmap style)":
         col1, col2 = st.columns(2)
@@ -264,7 +375,7 @@ for sector_name in selected_sectors:
 
 if not any_data:
     st.error(
-        "No live data could be retrieved for any sector. NSE frequently blocks requests "
-        "coming from cloud/datacenter IPs (including some Streamlit Cloud regions). "
-        "See the README for workarounds."
+        "No live or cached data could be retrieved for any sector. NSE frequently blocks "
+        "requests coming from cloud/datacenter IPs (including some Streamlit Cloud regions). "
+        "Once a live fetch succeeds once, it will be cached and used as a fallback going forward."
     )
