@@ -18,19 +18,6 @@ import requests
 import streamlit as st
 import plotly.graph_objects as go
 
-# NSE's bot-protection (Akamai) often fingerprints the TLS handshake itself,
-# not just headers/cookies — something the plain `requests` library can't fake.
-# `curl_cffi` impersonates a real Chrome TLS fingerprint and is frequently the
-# difference between "works in my browser" and "blocked from the server".
-# It's optional: the app falls back to plain `requests` if it isn't installed.
-try:
-    from curl_cffi import requests as curl_requests
-
-    HAS_CURL_CFFI = True
-except ImportError:
-    curl_requests = None
-    HAS_CURL_CFFI = False
-
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
@@ -59,193 +46,64 @@ SECTORS = {
 }
 
 NSE_BASE = "https://www.nseindia.com"
-NSE_HEATMAP_PAGE = "https://www.nseindia.com/market-data/live-market-indices/heatmap"
 NSE_API = "https://www.nseindia.com/api/equity-stockIndices"
 
-
-# Optional: set an HTTP(S) proxy in Streamlit secrets if your host's IP gets
-# blocked by NSE (common on cloud/datacenter IPs). In .streamlit/secrets.toml:
-#   NSE_PROXY = "http://user:pass@proxy-host:port"
-def _get_proxies():
-    try:
-        proxy = st.secrets.get("NSE_PROXY")
-    except Exception:
-        proxy = None
-    if proxy:
-        return {"http": proxy, "https": proxy}
-    return None
-
-
-BROWSER_HEADERS = {
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json, text/plain, */*",
+    "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Referer": NSE_HEATMAP_PAGE,
+    "Referer": "https://www.nseindia.com/market-data/live-market-indices/heatmap",
     "X-Requested-With": "XMLHttpRequest",
-    "sec-ch-ua": '"Chromium";v="126", "Not.A/Brand";v="24", "Google Chrome";v="126"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "DNT": "1",
 }
-
-PAGE_HEADERS = {
-    **BROWSER_HEADERS,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-}
-
 
 # --------------------------------------------------------------------------
 # DATA FETCHING
 # --------------------------------------------------------------------------
-def _new_session():
-    """Warm up a fresh session the way a real browser would: home page,
-    then the heatmap page itself, picking up NSE's anti-bot cookies along the way.
-    Uses curl_cffi (real Chrome TLS fingerprint) when available, since NSE's
-    bot protection often keys off the TLS handshake, not just HTTP headers."""
-    proxies = _get_proxies()
-    if HAS_CURL_CFFI:
-        s = curl_requests.Session(impersonate="chrome124")
-        if proxies:
-            s.proxies = proxies
-    else:
-        s = requests.Session()
-        if proxies:
-            s.proxies.update(proxies)
+@st.cache_resource(show_spinner=False)
+def get_session() -> requests.Session:
+    """NSE requires cookies from a normal page load before the API works."""
+    s = requests.Session()
+    s.headers.update(HEADERS)
     try:
-        s.get(NSE_BASE, headers=PAGE_HEADERS, timeout=12)
-        time.sleep(0.6)
-        s.get(NSE_HEATMAP_PAGE, headers=PAGE_HEADERS, timeout=12)
-        time.sleep(0.6)
+        s.get(NSE_BASE, timeout=10)
+        s.get(f"{NSE_BASE}/market-data/live-market-indices", timeout=10)
     except Exception:
         pass
     return s
 
 
-def get_session() -> requests.Session:
-    if "nse_session" not in st.session_state:
-        st.session_state.nse_session = _new_session()
-    return st.session_state.nse_session
-
-
-def reset_session():
-    st.session_state.nse_session = _new_session()
-
-
-def fetch_index_constituents(index_name: str, retries: int = 3):
-    """Fetch live constituent data for a single NSE sector index.
-    Returns (dataframe, diagnostic_message). Diagnostic message is empty on success."""
-    last_error = ""
+def fetch_index_constituents(index_name: str, retries: int = 3) -> pd.DataFrame:
+    """Fetch live constituent data for a single NSE sector index."""
     for attempt in range(retries):
         session = get_session()
         try:
-            resp = session.get(
-                NSE_API, params={"index": index_name}, headers=BROWSER_HEADERS, timeout=12
-            )
+            resp = session.get(NSE_API, params={"index": index_name}, timeout=10)
             if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except ValueError:
-                    last_error = (
-                        f"HTTP 200 but response wasn't JSON "
-                        f"(likely a block/captcha page, {len(resp.text)} bytes)."
-                    )
-                    reset_session()
-                    time.sleep(1 + attempt)
-                    continue
+                data = resp.json()
                 rows = data.get("data", [])
                 df = pd.DataFrame(rows)
                 if not df.empty and "symbol" in df.columns:
+                    # Drop the summary row for the index itself (symbol == index name)
                     df = df[df["symbol"].str.upper() != index_name.upper()]
                 if not df.empty:
-                    return df, ""
-                last_error = "Server returned 200 but no constituent rows."
-            elif resp.status_code in (401, 403):
-                last_error = f"HTTP {resp.status_code} - blocked/unauthorized (NSE anti-bot or IP block)."
-            elif resp.status_code == 429:
-                last_error = "HTTP 429 - rate limited by NSE."
-            else:
-                last_error = f"HTTP {resp.status_code}."
-        except requests.exceptions.Timeout:
-            last_error = "Request timed out."
-        except requests.exceptions.ConnectionError as e:
-            last_error = f"Connection error: {e.__class__.__name__}."
-        except Exception as e:
-            last_error = f"{e.__class__.__name__}: {e}"
-        reset_session()
-        time.sleep(1 + attempt)
-    return pd.DataFrame(), last_error
+                    return df
+        except Exception:
+            pass
+        # Session may be stale / blocked -> refresh cookies and retry
+        get_session.clear()
+        time.sleep(1)
+    return pd.DataFrame()
 
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
-def load_all_sectors(sector_map: dict):
+def load_all_sectors(sector_map: dict) -> tuple[dict, datetime]:
     result = {}
-    errors = {}
     for display_name, index_name in sector_map.items():
-        df, err = fetch_index_constituents(index_name)
-        result[display_name] = df
-        errors[display_name] = err
-        time.sleep(0.4)  # small stagger between sectors, easier on rate limits
-    return result, errors, datetime.now()
-
-
-def run_diagnostics():
-    """Quick step-by-step connectivity check the user can trigger from the sidebar."""
-    lines = []
-    lines.append(
-        f"HTTP engine: {'curl_cffi (Chrome TLS impersonation)' if HAS_CURL_CFFI else 'requests (no TLS impersonation - install curl_cffi for better results)'}"
-    )
-    proxies = _get_proxies()
-    s = curl_requests.Session(impersonate="chrome124") if HAS_CURL_CFFI else requests.Session()
-    if proxies:
-        if HAS_CURL_CFFI:
-            s.proxies = proxies
-        else:
-            s.proxies.update(proxies)
-        lines.append("Using proxy from secrets: yes")
-    else:
-        lines.append("Using proxy from secrets: no (set NSE_PROXY in secrets.toml if needed)")
-    try:
-        r1 = s.get(NSE_BASE, headers=PAGE_HEADERS, timeout=12)
-        lines.append(f"1) GET {NSE_BASE} -> HTTP {r1.status_code}, {len(r1.content)} bytes")
-    except Exception as e:
-        lines.append(f"1) GET {NSE_BASE} -> FAILED: {e}")
-        return lines
-    time.sleep(0.5)
-    try:
-        r2 = s.get(NSE_HEATMAP_PAGE, headers=PAGE_HEADERS, timeout=12)
-        lines.append(f"2) GET heatmap page -> HTTP {r2.status_code}, {len(r2.content)} bytes")
-    except Exception as e:
-        lines.append(f"2) GET heatmap page -> FAILED: {e}")
-    time.sleep(0.5)
-    try:
-        r3 = s.get(NSE_API, params={"index": "NIFTY AUTO"}, headers=BROWSER_HEADERS, timeout=12)
-        lines.append(f"3) GET api/equity-stockIndices?index=NIFTY AUTO -> HTTP {r3.status_code}")
-        ct = r3.headers.get("Content-Type", "")
-        lines.append(f"   Content-Type: {ct}")
-        if r3.status_code == 200:
-            try:
-                d = r3.json()
-                lines.append(f"   JSON OK, rows returned: {len(d.get('data', []))}")
-            except Exception:
-                lines.append(f"   Response is NOT valid JSON (first 200 chars): {r3.text[:200]!r}")
-        else:
-            lines.append(f"   Response first 200 chars: {r3.text[:200]!r}")
-    except Exception as e:
-        lines.append(f"3) GET api -> FAILED: {e}")
-    return lines
+        result[display_name] = fetch_index_constituents(index_name)
+    return result, datetime.now()
 
 
 def top_bottom(df: pd.DataFrame, n: int = TOP_N):
@@ -362,19 +220,7 @@ with st.sidebar:
     view_mode = st.radio("View", ["Tiles (heatmap style)", "Bar chart"], index=0)
     if st.button("🔄 Refresh now"):
         load_all_sectors.clear()
-        reset_session()
         st.rerun()
-
-    with st.expander("🔧 Connection diagnostics"):
-        st.caption(
-            "If sectors show 'could not fetch data', run this to see exactly "
-            "where the request is failing (this is almost always NSE blocking "
-            "the server's IP address, not a bug in the app)."
-        )
-        if st.button("Run diagnostic check"):
-            with st.spinner("Testing connection to NSE..."):
-                diag_lines = run_diagnostics()
-            st.code("\n".join(diag_lines))
 
 if not selected_sectors:
     st.warning("Select at least one sector from the sidebar.")
@@ -382,7 +228,7 @@ if not selected_sectors:
 
 with st.spinner("Fetching live NSE data..."):
     sector_map = {k: SECTORS[k] for k in selected_sectors}
-    all_data, all_errors, fetched_at = load_all_sectors(sector_map)
+    all_data, fetched_at = load_all_sectors(sector_map)
 
 st.caption(f"Last updated: {fetched_at.strftime('%Y-%m-%d %H:%M:%S')} (next refresh in ~{REFRESH_SECONDS}s)")
 
@@ -394,11 +240,9 @@ for sector_name in selected_sectors:
     st.subheader(sector_name)
 
     if top.empty and bottom.empty:
-        err = all_errors.get(sector_name, "Unknown error")
         st.info(
-            f"Could not fetch live data for this sector right now. Reason: **{err}** "
-            "Will retry on next refresh — open '🔧 Connection diagnostics' in the sidebar "
-            "for a full connectivity trace."
+            "Could not fetch live data for this sector right now "
+            "(NSE may be rate-limiting or temporarily unavailable). Will retry on next refresh."
         )
         continue
 
@@ -421,8 +265,6 @@ for sector_name in selected_sectors:
 if not any_data:
     st.error(
         "No live data could be retrieved for any sector. NSE frequently blocks requests "
-        "coming from cloud/datacenter IPs (including Streamlit Community Cloud), even "
-        "though the same site loads fine in your own browser. Run the diagnostic check "
-        "in the sidebar to confirm, and see the README for fixes (proxy, local hosting, "
-        "or a decoupled data-fetch job)."
+        "coming from cloud/datacenter IPs (including some Streamlit Cloud regions). "
+        "See the README for workarounds."
     )
