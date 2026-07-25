@@ -145,27 +145,50 @@ def get_session() -> requests.Session:
     return s
 
 
-def fetch_index_constituents(index_name: str, retries: int = 3) -> pd.DataFrame:
-    """Fetch live constituent data for a single NSE sector index."""
+def fetch_index_constituents(index_name: str, retries: int = 3) -> tuple[pd.DataFrame, str]:
+    """Fetch live constituent data for a single NSE sector index.
+
+    Returns (dataframe, error_message). error_message is "" on success, and
+    otherwise describes the last failure (HTTP status, timeout, blocked, etc.)
+    so we can show *why* it failed instead of a generic message.
+    """
+    last_error = "Unknown error"
     for attempt in range(retries):
         session = get_session()
         try:
             resp = session.get(NSE_API, params={"index": index_name}, timeout=10)
             if resp.status_code == 200:
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except ValueError:
+                    last_error = "HTTP 200 but response wasn't valid JSON (likely an NSE block/challenge page)"
+                    get_session.clear()
+                    time.sleep(1)
+                    continue
                 rows = data.get("data", [])
                 df = pd.DataFrame(rows)
                 if not df.empty and "symbol" in df.columns:
                     # Drop the summary row for the index itself (symbol == index name)
                     df = df[df["symbol"].str.upper() != index_name.upper()]
                 if not df.empty:
-                    return df
-        except Exception:
-            pass
+                    return df, ""
+                last_error = "HTTP 200 but no rows returned for this index"
+            elif resp.status_code in (401, 403):
+                last_error = f"HTTP {resp.status_code} Forbidden — NSE is blocking this request (common for cloud/datacenter IPs)"
+            elif resp.status_code == 429:
+                last_error = "HTTP 429 Too Many Requests — rate-limited by NSE"
+            else:
+                last_error = f"HTTP {resp.status_code}"
+        except requests.exceptions.Timeout:
+            last_error = "Request timed out"
+        except requests.exceptions.ConnectionError as e:
+            last_error = f"Connection error: {e}"
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
         # Session may be stale / blocked -> refresh cookies and retry
         get_session.clear()
         time.sleep(1)
-    return pd.DataFrame()
+    return pd.DataFrame(), last_error
 
 
 @st.cache_data(ttl=REFRESH_SECONDS, show_spinner=False)
@@ -173,23 +196,27 @@ def load_all_sectors(sector_map: dict) -> tuple[dict, dict, datetime]:
     """
     Returns:
         data: {display_name: DataFrame}
-        meta: {display_name: {"stale": bool, "as_of": str | None}}
+        meta: {display_name: {"stale": bool, "as_of": str | None, "error": str}}
         fetched_at: when this run happened
     """
     data = {}
     meta = {}
     for display_name, index_name in sector_map.items():
-        df = fetch_index_constituents(index_name)
+        df, error = fetch_index_constituents(index_name)
         if not df.empty:
             _cache_put(display_name, df)
             data[display_name] = df
-            meta[display_name] = {"stale": False, "as_of": None}
+            meta[display_name] = {"stale": False, "as_of": None, "error": ""}
         else:
             # Live fetch failed (market closed, NSE blocking, etc.) -> fall back
             # to the last successfully fetched data for this sector.
             cached_df, cached_ts = _cache_get(display_name)
             data[display_name] = cached_df
-            meta[display_name] = {"stale": not cached_df.empty, "as_of": cached_ts}
+            meta[display_name] = {
+                "stale": not cached_df.empty,
+                "as_of": cached_ts,
+                "error": error,
+            }
     return data, meta, datetime.now()
 
 
@@ -345,10 +372,13 @@ for sector_name in selected_sectors:
     st.subheader(sector_name)
 
     if top.empty and bottom.empty:
+        error_detail = meta.get("error", "")
         st.info(
             "Could not fetch live data for this sector, and no previous-session data is "
             "cached yet. Will retry on next refresh."
         )
+        if error_detail:
+            st.caption(f"⚠️ Last error: {error_detail}")
         continue
 
     any_data = True
@@ -379,3 +409,8 @@ if not any_data:
         "requests coming from cloud/datacenter IPs (including some Streamlit Cloud regions). "
         "Once a live fetch succeeds once, it will be cached and used as a fallback going forward."
     )
+
+with st.expander("🔍 Debug: last fetch error per sector"):
+    for sector_name in selected_sectors:
+        err = all_meta.get(sector_name, {}).get("error", "")
+        st.write(f"**{sector_name}**: {err or '(no error — fetched or cached data available)'}")
